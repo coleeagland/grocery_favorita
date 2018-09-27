@@ -1,0 +1,1365 @@
+---
+title: "Corporacion Favorita (Ecuador) - Predicting Grocery Sales"
+author: "Cole Eagland"
+date: "December 6, 2017"
+output:
+    html_document: default
+    df_print: kable
+    toc: true
+    toc_depth: 3
+---
+
+
+This data set is from a Kaggle competition located [here.](https://www.kaggle.com/c/favorita-grocery-sales-forecasting)
+The goal is to forecast product sales for Corporacion Favorita, an Ecuadorean Grocer with hundreds of stores and about 200,000
+unique products.
+
+The dependent variable will be unit sales, by store and item. So, how many eggs do we expect Quito store #5 to sell?
+
+The following process will be used, and the code will follow in order:
+
+* Initial data import, cleanup, and overview
+* Exploratory Data Analysis (which ~~may~~ will uncover the need for more data cleaning!)
+* Correlation between variables / determination of which supplementary data sets are valuable
+* Variable transformation and creation, if necessary
+* Model Development
+* Model evaluation and comparison
+
+**Showcasing the code used in this project is an additional goal. So, the code snippets are a lot longer than they might be in a project intended for final delivery. This is a walk through the discovery and modeling process.** With that said, I'll start with the list of packages:
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, tidy = FALSE)
+library(tidyverse)        # A collection of packages for data munging (including dplyr)
+library(stringr)          # Working with strings
+library(lubridate)        # For working with dates
+library(scales)           # Improved formatting of ggplot charts
+library(data.table)       # Fast data manipulation
+library(sjmisc)           # Includes some useful functions for working with data
+library(mgcv)             # Generalized additive models
+library(knitr)            # For R markdown
+library(kableExtra)       # Styling R markdown tables
+library(fst)              # Fast write/read of large data sets
+library(gridExtra)        # For multiple plots
+library(randomForest)     # In this case, using for variable selection
+library(ggfortify)        # Extends ability of ggplot::autoplot to ts objects
+library(forecast)         # Time series (primary)
+library(zoo)              # Time series (some useful functions)
+library(tscount)          # Time series for count data
+
+options(width = 500, scipen=5)
+```
+
+# Data Import, Cleanup, and Overivew
+
+## Data Import
+
+Two functions are used to import the data. Initially, *fread* from the data.table package is used for it's speed reading in csv files. Then, *read.fst* from the fst package is used to read in the large training data set - though the package will not read in csv files, r objects can be written to fst files and read in much faster in the future (fst works about 4-6x faster than fread).
+
+The training data is particularly large, at 4.5GB. To make sure there is enough room in the working memory, a 10% sample of the training data (10% of items) will be used for Exploratory Data Analysis.
+
+The remaining data sets are much smaller and are read in completely, all using *fread*.
+
+A word of caution - the fst file reads in dates differently (days since 1/1/1970) than fread (character).
+
+
+```{r rawdataread, cache=TRUE}
+
+#train        <- fread("train.csv") #About 4.5GB
+transactions <- fread("transactions.csv")
+items        <- fread("items.csv")
+holidays     <- fread("holidays_events.csv")
+oil          <- fread("oil.csv")
+stores       <- fread("stores.csv")
+calendar     <- fread("calendar_conversion.csv") #A personal file used for working with dates
+
+#set.seed(822)
+#item.sample  <- sample(items$item_nbr, length(items$item_nbr)*0.1)
+#train <- train[item_nbr %in% item.sample]
+#write.fst(train,"train.fst", compress = 100)
+
+train <- read.fst("train.fst", as.data.table = TRUE)
+```
+
+
+## Data - Initial Cleanup
+
+The preferred method for naming identifiers in R is the format variable.name, and lowerCamelCase is also accepted. My preference is the variable.name method, so whenever I get a new data set, I change the variable names to lowercase and remove any characters that don't match the preferred naming convention. Underscores are the worst offender (I reserve these for function names). Below, I make these quick naming fixes.
+
+In addition to the names not being quite right, the only other immediately obvious fix is the dates. The *fread* function always reads dates as characters, so this is expected behavior. The base R as.Date function is helpful here... but quite slow - there is a bottleneck at the underlying strptime function. To dramatically improve the date conversion speed, fast_strptime is used from the handy *lubridate* package. In this case, as.Date alone took 75 seconds to convert the train data set, while adding in fast_strptime reduced the conversion to only 2 seconds.
+
+The largest data set, train, freezes on the fast_strptime function, so there is a slowdown here.
+
+```{r initialcleanup, message=FALSE, cache=TRUE}
+# Function for changing identifiers to preferred variable.name format
+name.clean <- function(df) {
+  names(df) <- gsub("_",".",names(df))
+  names(df) <- tolower(names(df))
+  data.table(df)
+}
+
+# Repeated code like this is usually an indicator to use a loop or apply function, but there's no
+# significant reduction in typing or speed in this case - just added complication
+stores         <- name.clean(stores)
+train          <- name.clean(train)
+transactions   <- name.clean(transactions)
+items          <- name.clean(items)
+holidays       <- name.clean(holidays)
+
+# Dates are read in as character vectors and days since 1/1/1970 (train data)
+# This changes them back to dates
+train        <- train[, date := as.Date(date, origin = "1970-01-01")]
+holidays     <- holidays[, date := as.Date(fast_strptime(date, "%Y-%m-%d"))]
+oil          <- oil[, date := as.Date(fast_strptime(date, "%Y-%m-%d"))]
+transactions <- transactions[, date := as.Date(fast_strptime(date, "%Y-%m-%d"))]
+calendar     <- calendar[, date := as.Date(strp.date, "%m/%d/%Y")] %>% select(date,week,month,period,quarter,year,payday,payweek)
+
+```
+
+
+## Data - Overview
+
+Now that the variables are ready to work with, we'll take a look at what they actually are. The 6 data sets to be used for exploratory analysis are shown in the table below with their variable names, a count of the variables, and the number of observations in the data set.
+
+```{r dataoverview, cache=TRUE}
+df.of.interest <- list("train","oil","holidays","items","stores","transactions")
+datasets <- data.frame(Dataset = as.character(c("train","oil","holidays","items","stores","transactions")),
+                       variables = unlist(lapply(df.of.interest, function(x) paste(names(get(x)),collapse = ", "))),
+                       variable.count = unlist(lapply(df.of.interest, function(x) dim(get(x))[2])),
+                       variable.obs   = unlist(lapply(df.of.interest, function(x) dim(get(x))[1])))
+kable(datasets, format = "html", caption = "Grocery Datasets") %>% kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE, position = "left")
+```
+
+
+Corporation Favorita has provided several data sets to help predict sales. The table below shows some basic information about each data set.
+
+
+The primary data set is *train*, with over 125 million observations (10% used - shown here). This is the most basic sales data, with a date/store/item, how many were sold, and whether the item was on promotion when it was sold. The included data begins on January 1st, 2013 and ends on August 15, 2017.
+
+**oil** - Daily oil prices. Ecuador's economy is dependent on oil prices - lower oil prices have been a challenge for Ecuador, and we'll use oil prices to help predict grocery sales.
+
+**holidays** - A list of all holidays, including local holidays, wherever Corporacion Favorita has stores. The first holiday in the data is on March 2, 2012, and the last is December 26, 2017. The type and transferred variables are of special interest. A transferred holiday is a holiday which falls on a weekend, and so is moved to another day. So - a transferred holiday is not a holiday at all. However, if the type is "Transfer", that means the date had a holiday transferred to it from the weekend. Generally, this is a weekend holiday being transferred to a Monday or Friday, just as we do in the United States. There is one slightly more complicated type we don't see so much in the United States. Bridge days are days added to holidays to extend a long weekend. These days are made up by working on a day that would normally be a day off. This could get fun!
+
+**items** - A listing of each item sold in the stores (with an item number, not a name), the "family" (grocery, cleaning, bakery, and others), class (unclear what this means) and whether or not the item is perishable. We're using a subset of items for the analysis to reduce memory requirements.
+
+**stores** - A list of stores by location, type, and cluster. It's not clear what type means. The cluster is a pre-selected clustering of stores based on their characteristics, though no detail is provided to indicate what characteristics were used in the clustering. It's likely that whomever did the clusters had more detail than was provided with this data, though we may try to cluster separately or at least identify which characteristics were used in clustering.
+
+**transactions** - These are not individual transactions (though that would be nice to have!). Rather, it's a count of the number of transactions by store, by day.The data beings on January 1st, 2013 and ends on August 15, 2017.
+
+At first glance, two potential issues that jump out are missing variables we might expect to see. The first is price - nowhere in the data set does it show how much the items were sold for, and in fact there's no financial indicators at all that would allow the calculation of an item price. Isolating the effects of the variables we have without considering pricing will be more of a challenge. The second missing detail I noticed was promotions data. **onpromotion** is a binary variable - it's not clear whether the promotion just means a sale, or if the product was displayed a particular way, or if a coupon was available and how much it was... in other words, "promotion" can mean a lot of things, but the data does not include these details.
+
+**Additional Considerations** - On April 16, 2016, a 7.8 magnitude earthquake hit Ecuador, killing hundreds of people, injuring thousands, and causing about $3 billion in economic damage. Aside from these immediate effects, donations of food and water into the country may have affected grocery sales. In addition, sales and income tax were also increased following the earthquake.
+
+Public sector paydays in Ecuador occur on the 15th and last days of each month, which may also be a factor in unit sales of a given item.
+
+#More specific details on each dataset {.tabset .tabset-fade .tabset-pills}
+
+A summary and glimpse of each data set provides more detailed information.
+
+##train
+``` {r}
+summary(train)
+```
+
+``` {r}
+glimpse(train, width=100)
+```
+
+##oil
+``` {r}
+summary(oil)
+```
+
+``` {r}
+glimpse(oil, width=100)
+```
+
+##holidays
+``` {r}
+summary(holidays)
+```
+
+``` {r}
+glimpse(holidays, width=100)
+```
+
+##items
+``` {r}
+summary(items)
+```
+
+``` {r}
+glimpse(items, width=100)
+```
+
+##stores
+``` {r}
+summary(stores)
+```
+
+``` {r}
+glimpse(stores, width=100)
+```
+
+##transactions
+``` {r}
+summary(transactions)
+```
+
+``` {r}
+glimpse(transactions, width=100)
+```
+
+#Exploratory Analysis on each dataset
+
+First, we'll look at all of the data sets individually. There is some small frustration in this activity - the temptation is to combine all the data right away and start looking at "transactions by" data all over the place. However, I find value in looking at the data and understanding it separately when given the opportunity. In the following section, we'll combine data to understand how the different features/data sets are related.
+
+In exploratory data analysis, I make use of the *dplyr*, *ggplot*, and *data.table packages*. *dplyr* code has very readable functions, with most actions being based on 5 primary verbs (filter, select, mutate, arrange, and summarise) with the addition of group_by, a great deal of data modification can be completed. *dplyr* works great on small to medium-sized data, but can be slower than *data.table* for data this large. Speed aside, *data.table* allows modifications *by reference*, which means it doesn't have to make copies of data during operations (which take up more space in memory). This can be an issue with data sets as large as the train data set used here.
+
+##Holidays
+
+An initial look shows a distribution of holidays one might expect. Most of the days off are actual holidays, then we have events (though don't yet know what they are), and "additional" days.
+
+Additional days are consistent in the data, and represent days near holidays that may be treated something like holidays, though they're not official. The days of Christmas week, for example, are marked as additional days. They may not be public holidays, but in general people are working less and the days may look more like holidays than work days in the sales data, or somewhere in between.
+
+``` {r holidayplots1, message=FALSE, fig.width = 10}
+holidays <- left_join(holidays,calendar) %>% data.table() # Adding period/quarter/year
+holidays <- holidays %>% rename(holiday.type = type)
+
+p1 <- ggplot(holidays %>% filter(year > 2012), aes(x=holiday.type, fill=holiday.type)) +
+  geom_bar(fill=c("lightblue")) +
+  ggtitle("Ecuador Holidays by type, 2013-2017") +
+  theme_bw() +
+  theme(legend.position = "none") 
+
+p2 <- ggplot(holidays %>% filter(year > 2012), aes(x=locale, fill=locale)) +
+  geom_bar(fill="lightblue") +
+  ggtitle("Ecuador Holidays by locale, 2013-2017") +
+  theme_bw() +
+  theme(legend.position = "none") 
+
+#Arranging the plots in two columns together for cleaner output
+grid.arrange(p1,p2,ncol=2)
+
+```
+
+There's less consistency than one might expect. But, it's not unusual for the exact date of a holiday to move. What really stands out here are 2016 period 5 and 2014 period 7. That seems an unusually high number of holidays. But, at least it's narrowed down.
+
+
+```{r holidayplots2, warning=FALSE, fig.width = 10}
+p1 <- ggplot(holidays %>% 
+         filter(year > 2012) %>%
+         group_by(year) %>%
+         tally(), aes(x=year, y=n)) +
+  geom_bar(stat="identity", fill="lightblue") +
+  theme_bw() +
+  ggtitle("Total Holidays by Year, 2013-2017")
+
+holiday.viz <- holidays %>%
+  filter(year > 2012) %>%
+  group_by(period, year) %>%
+  arrange(period) %>%
+  tally() %>%
+  mutate(year = factor(year))
+
+p2 <- ggplot(holiday.viz, aes(x=period, y=n, col=year)) +
+  geom_line(size=1.5) +
+  ggtitle("Ecuador Holidays by Period and Year, 2013 -2017") +
+  theme_bw() +
+  scale_x_continuous(breaks=seq(1,13,1)) +
+  ylab("count") 
+
+grid.arrange(p1,p2,ncol=2)
+```
+
+Let's look at the data for holidays in those periods. We find...
+
+
+``` {r holidayevents}
+holidays %>% 
+  filter((year == 2014 & period == 7) | (year == 2016 & period == 5)) %>%
+  select(date,holiday.type,description)
+```
+
+Of course! The 2014 world cup. But, these are not really holidays... they are events! 
+
+Now I understand the difference, and they must be treated differently. It's also nice to know what they really mean - this particular data is more than I expected to have.
+
+The other event is the 2016 earthquake - included are the day of the quake and the 30 days that followed. 30 is likely set arbitrarily but is a good place to start. We can explore further to see when sales seem to go back to normal.
+
+Next, let's see what events occurred that were not the World Cup or the Earthquake, and create an earthquake identifier (may need it later).
+
+``` {r holidayearthquake, warning=FALSE}
+holidays %>%
+  filter(holiday.type=="Event" & !grepl("Mundial de futbol", description) & !grepl("Terremoto Manabi", description)) %>%
+  select(description) %>%
+  unique() %>%
+  kable(format = "html") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE, position = "left")
+
+```
+
+Not many! Dia de la Madre (Mother's Day), plus Black Friday and Cyber Monday starting in 2014. Let's do another check of holidays, but without considering events.
+
+> A kable aside: The kableExtra package and kable function in knitr offer improved table display. The kable_styling options above are consistent throughout this document. A left-aligned table that does not take up the full_width of the page (unless necessary). The striped/hover options highlight the table row when hovering over with the mouse cursor (try it above!)
+
+Without including events (the Earthquake and World Cup), the number of holidays each year seems much more consistent.
+
+```{r holidayplots3, fig.width=10, warning=FALSE}
+holidays <- holidays[, earthquake := ifelse(grepl("Terremoto",description),1,0)] #Creating indicator for earthquake, to be used later
+
+ggplot(holidays %>%
+         filter(holiday.type != "Event" & year > 2012) %>%
+         group_by(year) %>%
+         tally(), aes(x=year, y=n)) +
+  geom_bar(stat="identity", fill="lightblue") +
+  theme_bw() +
+  ggtitle("Total Holidays by Year (Events Excluded), 2013-2017")
+```
+
+
+
+##Items
+
+This data set includes one entry for each item sold. The additional variables are family, class, and a binary variable indicating whether or not the item is perishable.
+
+This is only the top 10 families. It's useful to showcase the different items we expect to see in a store and the distribution of items among families. This is the only variable we have to identify products in a "non-numeric" way. It's difficult to tell the difference between things like Grocery I and Grocery II (not shown), but that may come out as we look at sales within each family.
+
+``` {r }
+table(items$family) %>%
+  data.frame() %>%
+  rename(Family = Var1, Frequency = Freq) %>%
+  arrange(desc(Frequency)) %>%
+  head(n=10) %>%
+  kable(format = "html") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE, position = "left")
+```
+
+
+Unlike families, the classes tell us little new information about products. There are around 250 different classes, but over 100 of those only include 1 or 2 items. The largest class includes 133 items.
+
+
+``` {r fig.width=10}
+class.detail <- table(items$class) %>%
+  data.frame() %>%
+  rename(Class=Var1, Frequency = Freq) %>%
+  select(Frequency) %>%
+  unlist() %>%
+  unname() %>%
+  cut(breaks = c(0,1,2,3,4,5,10,20,50,100,133), include.lowest=TRUE) %>%
+  table() %>%
+  data.frame() %>%
+  rename(NumItems = ".", NumClasses=Freq)
+
+ggplot(class.detail, aes(x=NumItems, y=NumClasses)) +
+  geom_bar(stat="identity", fill="lightblue") +
+  scale_x_discrete(labels = c("1","2","3","4","5",">5 to 10",">10 to 20",">20 to 50",">50 to 100", ">100")) +
+  labs(y="Number of Classes", x="Number of Items in Class") +
+  ggtitle("Over 100 classes comprise only one or two items") +
+  theme_bw()
+```
+
+About 1/4 of the items sold in the store are perishable.
+
+``` {r }
+perishable <- items$perishable %>% table() %>% prop.table() %>% round(3)
+names(perishable) <- c("Non-Perishable","Perishable")
+perishable
+```
+
+Now that we've looked at the variables individually, we may be able to learn more about them by looking at them together. First we'll find out whether we can learn more about the classes by combining them with family.
+
+Only ~20 classes are shown here, but it's clear that each class has items from only one family. Classes 1002 to 1096 have Grocery I items, classes 1114 to 1190 have Beverages items, and so on. So right now we know that class is a subgroup of Family... but not much more than that. We will have to combine data sets and look at other characteristics of each class to determine whether there's any predictive value.
+
+Further, we learn that the Grocery I/II families do not include perishable items, and classes either include all perishable items or no perishable items. While it's unclear how much of this will be useful, it's helpful to understand the data.
+
+``` {r message = FALSE}
+classfamily <- table(items$class,items$family) %>% data.frame() %>% filter(Freq != 0)
+names(classfamily) <- c("Class","Family","NumItems")
+perish.by.class <- items[, lapply(.SD, sum), by = class, .SDcols = "perishable"]
+names(perish.by.class) <- c("Class","Perishable")
+perish.by.class$Class <- factor(perish.by.class$Class)
+classfamily <- left_join(classfamily, perish.by.class) %>%
+  filter(Family %in% c("AUTOMOTIVE","BEVERAGES","BREAD/BAKERY","GROCERY I"))
+classfamily[c(1:11,27:32,75:80),]
+```
+
+
+
+
+##Oil
+
+The oil data set includes only two variables: date and price (the world oil price).
+
+In 2014, oil prices decreased by about 50%, then took another big dip, in late-2015, then recovered and have remained relatively steady at a rough $50/barrel since mid-2016.
+
+``` {r warning=FALSE, message=FALSE}
+oil <- oil %>% rename(oil.price = dcoilwtico) #Making the name easier to read
+
+oildat <- data.frame(date = seq(min(oil$date),max(oil$date),by = "days"))
+oil <- left_join(oildat,oil) %>%
+          mutate(day.of.week = lubridate::wday(date)) %>%
+          data.table()
+rm(oildat)
+
+oil <- oil[, ':='(oil.price = ifelse(day.of.week == 7, lag(oil.price,1L),
+                                    ifelse(day.of.week == 1, lag(oil.price,2L), oil.price)))][
+           , oil.price := na.approx(oil.price, na.rm=FALSE)]
+```
+
+The main challenge with the oil data set is the missing values. The data has some missing values that aren't explained, and it doesn't include weekends (which is expected). First, we fill the weekend dates with whatever the oil price was on the previous Friday. For the remaining missing values, na.approx from the *zoo* package imputes the remaining missing values using lag and lead non-missing values. 
+
+```{r warning=FALSE, message=FALSE}
+oil <- left_join(oil,calendar) %>% data.table()
+
+ggplot(oil, aes(x=date, y=oil.price)) +
+  geom_line(col="darkblue", size=1) +
+  ggtitle("World Oil Prices, Jan 2013 - August 2017") +
+  theme_bw()
+
+```
+
+
+##Stores
+
+There are 54 stores in the data in 13 different states and 18 different cities. About half are in Guayaquil and Quito, two of Ecuador's most populous cities.
+
+The type and cluster variables are the real variables of interest in the stores data. There are 5 types, A-E, and
+17 clusters. We don't know how the clusters were formed, and of course the match works out to about 3 stores per clusters.
+
+In the tables below, there's no clear indication of how the cluster and type variables might tie together. While it does seem there is some relationship (6 of the 8 type B stores are in cluster 6, for example), it doesn't tell us much about how the clusters were formed. Because of a hunch on what the store type is, I pulled in the estimated populations (mostly Wikipedia) of each of the 18 cities... and learned nothing. 
+
+
+```{r}
+#This will have to do - getting bored of bar charts just to show these numbers
+table(stores$type) %>%
+  data.frame() %>%
+  rename(Type = Var1, Frequency = Freq) %>%
+  kable(format = "html") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE, position = "left")
+
+table(stores$type,stores$cluster) %>%
+  data.frame() %>%
+  rename(Type = Var1, Cluster = Var2, Frequency = Freq) %>%
+  spread(Cluster,Frequency) %>%
+  kable(format = "html", caption = "Cluster by Type (Columns are Clusters)") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE, position = "left")
+```
+
+##Transactions
+
+This is where things start to get interesting. Finally, sales data! We'll start by bringing in calendar data and aggregating across time periods. This will give some indication of seasonality. Though we could also look by store number, that will be reserved for the next section so we can also include store type and cluster.
+
+Because we're aggregating by weeks and periods, the 2017 data is filtered out for the initial look - this data is only complete into August 2017, and it's easier to see trends if we include only complete years, 2013-2016.
+
+```{r message=FALSE}
+transactions <- left_join(transactions,calendar) %>% data.table()
+transactions %>% 
+  filter(year < 2017) %>%
+  mutate(weekyear = year*100 + week) %>%
+  filter(weekyear > 201448 & weekyear < 201504) %>%
+  group_by(weekyear) %>%
+  tally()
+```
+
+The table above shows the year, week, and a count of "store days". 336/7 = 48 stores. This is short of 54 - it's likely the remaining 6 have been opened since the start of 2015. Week 53 has 48 "store days"... because week 53 is actually only a single day (2 on the leap years). There are other ways to cut weeks, such as by starting on the first Monday of the year. But, given that we have good holiday info, we'll stick with the current method of starting the first week on January 1st.
+
+What's more interesting here are weeks 52 and 1. It seems all of the stores were probably closed on Christmas and New Year's Day (336-288 = 48 "store days" closed). The 289 in January means one store stayed open on January 1st, or there's an error in the data.
+
+Next, we look at total sales by period and week to see if there are any obvious seasonal patterns.
+
+```{r fig.width=10, message=FALSE}
+transactions.agg <- transactions[year < 2017, lapply(.SD,sum), by = period, .SDcols = "transactions"]
+
+p1 <- ggplot(transactions.agg,
+       aes(x=period, y=transactions)) +
+      geom_point(size=1.5) +
+      scale_x_continuous(breaks = seq(0,55,5)) +
+      ggtitle("Total Sales by Period") +
+      theme_bw()
+
+transactions.agg <- transactions[year < 2017, lapply(.SD,sum), by = week, .SDcols = "transactions"]
+
+p2 <- ggplot(transactions.agg,
+       aes(x=week, y=transactions)) +
+      geom_point(size=1.5) +
+      scale_x_continuous(breaks = seq(0,55,5)) +
+      ggtitle("Total Sales by Week") +
+      theme_bw()
+
+grid.arrange(p1,p2,ncol=2)
+
+```
+
+It appears the start of the year is weak, then things are mostly steady until the last few weeks of the year, when sales really pick up.
+
+```{r}
+transactions %>%
+  group_by(period,year) %>%
+  tally() %>%
+  summarize(mean.transactions = mean(n)) %>%
+  kable(caption = "Mean Transactions Across Stores, by Period", format="html") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE, position = "left")
+
+(1390-1312)/1390 #A rough measure of the difference in store days between periods 1 and the rest of the periods
+(9100000-7500000)/9100000 #A rough measure of the difference in sales between period 1 and the rest of the periods
+```
+
+The basic estimate above shows that period 1 has about 5-6% fewer days open than in the rest of the periods... but about 17-18% fewer unit sales (in the graphic we can see they're about 40% smaller than period 13 sales.
+
+Next, we'll look at whether sales are generally increasing over time, and get some idea of how much different we can expect sales to be on weeks where there was a payday.
+
+```{r warning=FALSE}
+
+transactions.agg <- transactions %>%
+                      group_by(date) %>%
+                      summarize(transactions = sum(transactions),
+                                payday = mean(payday))
+
+ggplot(transactions.agg, aes(x=date,y=transactions, color=factor(payday))) +
+  geom_point(size=2) +
+  geom_smooth(method="lm") +
+  ggtitle("Daily Transactions by Payday, 2013-2017") +
+  labs(subtitle = "No obvious difference between paydays and non-paydays") +
+  theme_bw()
+
+transactions.agg <- transactions %>%
+                      group_by(year, week) %>%
+                      summarize(transactions = sum(transactions),
+                                payweek = mean(payweek)) %>%
+                      mutate(yearweek = factor(year*100 + week))
+
+ggplot(transactions.agg, aes(x=factor(yearweek),y=transactions, color=factor(payweek))) +
+  geom_point(size=2) +
+  ggtitle("Daily Transactions by Payweek, 2013-2017") +
+  labs(subtitle = "No obvious difference between payweeks and non-payweeks",
+       x = "Year / Week") +
+  theme_bw() +
+  theme(axis.text.x = element_blank())
+```
+
+Surprisingly, there's no obvious difference between paydays or pay weeks and weeks where the public sector did not get paid. The expectation of payment on the 15th and the end of the month is for the public sector. The public sector in Ecuador  makes up about 9.3% of the workforce [Source](https://www.google.com/url?sa=t&rct=j&q=&esrc=s&source=web&cd=1&cad=rja&uact=8&ved=0ahUKEwi58Pj1tLnXAhVN5GMKHbJFCjUQFggoMAA&url=https%3A%2F%2Fwww.oecd.org%2Fgov%2Flac-ecuador.pdf&usg=AOvVaw1ia6weZSn3XaJKG6VR4TNs), and maybe that's not enough to see an obvious difference in sales (in a graphic).
+
+Finally, we look at mean sales per store. Have they been increasing over time?
+
+```{r message=FALSE}
+transactions.agg <- transactions %>%
+                      group_by(date) %>%
+                        summarize(n = n(),
+                                  transactions = sum(transactions),
+                                  transactionsPerStore = transactions/n)
+
+ggplot(transactions.agg, aes(x=date,y=transactionsPerStore)) +
+  geom_point(size=2) +
+  geom_smooth() +
+  geom_smooth(method = "lm") +
+  ggtitle("Daily Average Sales by Store") +
+  labs(subtitle="Mean sales do not appear to be increasing over time") +
+  theme_bw()
+
+```
+
+It doesn't look like mean sales have increased. Though Corporacion Favorita would probably love for each of their stores to increase sales, it also may be true that their strategy is to grow with new stores rather than within store. The overall goal of this project is to improve inventory forecasting - it may just be that there are more opportunities to influence costs vs top line.
+
+
+##Training
+
+Finally, we get to the training data. This includes sales by item, store, and date. In the next section we'll examine these sales more closely as they relate to the other data sets. In our "single data set" look, we'll just look at the unit sales summary, plus promotion data and how it relates to items.
+
+```{r cache=TRUE}
+summary(train$unit.sales)
+
+ggplot(train %>%
+         filter(unit.sales > -100, unit.sales < 100),
+       aes(x=unit.sales)) + geom_histogram(binwidth=1) +
+       ggtitle("Histogram of unit sales (within 100 units of 0)")+
+       theme_bw()
+
+```
+
+For our quick look at unit.sales, two things are immediately apparent.
+
+* Negative unit sales (returns)
+* Non-integer values (bulk items sold by weight)
+* Some extreme min/max figures
+
+The large figures could be high frequency items - or they could be items with fairly regular sales sold in small units, such as grams. This is a place where having transaction dollars would help clarify some things.
+
+The histogram shows us that without consideration for the item, a 1 sale day is the most common. The higher the number of sales in a day, the less frequently they occur. So, days with an item selling 10 items are less frequent than days with an item selling 9 times, which are less frequent than an item selling 8 times... 
+
+```{r}
+promotbl <- table(train$onpromotion,useNA="ifany") %>%
+  data.frame() %>%
+  rename(Promotion = Var1) %>%
+  mutate(perc = Freq / sum(Freq))
+
+ggplot(promotbl, aes(x=Promotion, y=perc)) +
+  geom_bar(stat="identity", fill=c("lightblue","lightblue","pink")) +
+  ggtitle("Totals of onpromotion factor variable") +
+  labs(subtitle = "Unclear why there is missing data",
+       y = "Percent of Total") +
+  theme_bw()
+
+```
+
+Nearly 20% of the data is missing! Where could it be?
+
+``` {r nacheck1}
+manynas <- train[train$item.nbr == "938567" & train$store.nbr == 1,]
+manynas[manynas$date > as.Date("2014-03-25") & manynas$date < as.Date("2014-04-05"),]
+
+```
+
+The missing values seem to cut off abruptly here... what if we look at all of the data before the cutoff data and all of the data after?
+
+```{r nacheck2}
+table(train$onpromotion[train$date <  as.Date("2014-04-01")], useNA = "ifany")
+table(train$onpromotion[train$date >= as.Date("2014-04-01")], useNA = "ifany")
+
+```
+
+It looks like promotions were not tracked before April 2014 (verified on many item numbers, not just those shown here). It's always nice to know why the data are missing.
+
+##Initial EDA Wrap-up
+
+At this point, we've got a good idea of what each of the data sets looks like. We've seen where the data might need some massaging, we have a good idea of what the seasonality looks like, and we can now start combining everything into a workable data set for further analysis.
+
+
+#Exploratory Data Analysis - Combined Data set
+
+The training data is joined with the other data sets(except transactions). Now we can look at the relationships with sales and the variables already explored, and begin exploratory modeling with a few sample items. The final data set will require the creation of some binary variables, but for now we'll avoid that for easier data views.
+
+
+##Holidays
+
+We've already explored holidays, but now we want to see what relationship there might be between holidays and sales before considering holidays in our model
+
+```{r message=FALSE}
+#Adjusting for missing values
+train.holiday <- left_join(train,holidays)
+holiday.vars <- c("holiday.type","locale","locale.name","transferred")
+train.holiday <- train.holiday %>%
+  mutate_at(.vars = vars(holiday.vars),
+            .funs = funs(sjmisc::replace_na),
+            value = "Non-Holiday") %>%
+  data.table()
+
+```
+
+```{r}
+holiday.summary <- train.holiday %>%
+                    group_by(date,store.nbr,holiday.type) %>%
+                    summarise(total.sales = sum(unit.sales), n()) %>%
+                    group_by(date,holiday.type) %>%
+                    summarise(total.sales = sum(total.sales), stores = n(),
+                              mean.sales.per.store = total.sales/stores) %>%
+                    filter(date != as.Date("2013-01-01"))
+                    #Jan 1, 2013 has a single store open and seems an outlier (minimum sales of any day in the data)
+ggplot(holiday.summary, aes(x=holiday.type, y=mean.sales.per.store)) +
+  geom_boxplot(fill="lightblue") +
+  ggtitle("Boxplot of Mean Sales Per Store by Holiday Type") +
+  labs(y="Mean Sales Per Store",
+       x="Holiday Type",
+       subtitle = "While there is some indication of differences between groups, they're not immediately obvious") +
+  theme_bw() 
+
+holiday.anova <- aov(mean.sales.per.store ~ holiday.type, data=holiday.summary)
+summary(holiday.anova)
+
+holiday.compare <- TukeyHSD(holiday.anova)
+
+holiday.compare$holiday.type[c(1:21),c(1:4)] %>%
+  data.frame() %>%
+  cbind(data.frame(rownames(.)),.) %>%
+  tbl_df() %>% rename(compare = "rownames...") %>%
+  arrange(p.adj)
+
+```
+
+
+For the first pass, we use ANOVA and Tukey's HSD test to determine whether there are any meaningful differences in mean sales by store between holiday types. The initial ANOVA results in *F=12.82* and *p=3.33e-14*. That's enough evidence to tell us there are likely some differences between the holiday types.
+
+The Tukey HSD test gives us some idea of where those differences might be. Of the 21 different comparisons, only 5 had p-values we might consider significant, and 1 or 2 of those are borderline (0.05 and 0.014).
+
+We'll also take a quick look at the diagnostic plots. Clearly, there are some outliers, and calling the residuals normally distributed would be a stretch given those tails. However, this is preliminary and just helps to inform our future modeling decisions.
+
+```{r echo=FALSE, warning=FALSE}
+par(mfrow=c(2,2))
+plot(holiday.anova)
+par(mfrow=c(1,1))
+rm(list = c("train.holiday", "holiday.summary", "holiday.compare", "holiday.anova"))
+```
+
+##Oil
+
+It's not clear yet what to do with oil. A good strategy might be to find out whether there is any relationship at all between oil and sales.
+
+Higher oil prices generally benefit Ecuador, a member of OPEC. Do we have any evidence that oil prices have some effect on sales?
+
+
+```{r warning=FALSE, message=FALSE}
+train.oil <- left_join(train, oil)
+train.oil <- left_join(train.oil, calendar)
+
+# Correlation between current oil price and unit sales
+oilcor <- train.oil %>% group_by(date,oil.price) %>% summarize(unit.sales = sum(unit.sales))
+
+ggplot(oilcor, aes(x=oil.price, y=unit.sales)) +
+  geom_point(alpha=0.5) +
+  geom_smooth() +
+  ggtitle("Scatterplot of Unit Sales on Oil Price") +
+  labs(x = "Oil Price",
+       y = "Unit Sales") +
+  theme_bw() +
+  annotate(x=88, y=215000,
+         label=paste("r = ", round(cor(oilcor$oil.price, oilcor$unit.sales, use="complete.obs"),2)),
+         geom="text", size=5)
+
+```
+```{r include=FALSE}
+rm(list = c("oilcor","train.oil"))
+```
+
+It does seem there is some kind of correlation between oil price and unit sales... a negative correlation, *r=-0.66*. It may just be that more stores were added and sales increased over time, while the oil price dropped over time. Not necessarily predictive, but the correlation is high enough to consider noteworthy.
+
+It's also obvious here how quickly the price of oil fell! The prices are centered around $45 and $100, but with a gap from $60 to $80 with few values.
+
+##Items
+
+The items data set is less fun than it would be if we actually knew what the items were... but let's look anyway.
+
+```{r fig.width=10, warning=FALSE, message=FALSE}
+train.item <- left_join(train,items) %>% data.table()
+
+item.summary <- train.item[, lapply(.SD, sum), by = .(date,family,perishable), .SDcols="unit.sales"]
+ggplot(item.summary, aes(x = date,  y = unit.sales, color=factor(perishable))) +
+  geom_line(size=1.5) +
+  facet_wrap(~family) +
+  scale_y_log10() +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+```
+
+These are on the log scale (to make the graphics more readable), but we can see that most products have fairly consistent trends, either flat or upward.
+
+Certain families appear only partway through the history. Automotive, for example, wasn't sold until late 2015. Lawn and Garden only appears from the end of 2016. More surprisingly, there is no 2013 data for produce, magazines, or home and kitchen products. Though this is a sample of a large data set, it's possible there were items in these categories, but they're in the larger sample.
+
+In the case of poultry, there is a full history but sales increased substantially in 2014 before steadying. A quick look at the first time each poultry item appeared indicates that 5 of the 6 poultry items were added over the course of a week in November 2013. For other families, with items added in the latter half of 2015, this might become a challenge.
+
+``` {r}
+poultry.dates <- c()
+poultry.items <- train.item %>% filter(family == "POULTRY") %>% select(item.nbr) %>% unique() %>% unlist() %>% unname()
+for (i in poultry.items) poultry.dates <- c(poultry.dates,min(train$date[train$item.nbr == i], na.rm = TRUE))
+poultry.dates <- as.Date(poultry.dates,origin = "1970-01-01")
+data.frame(poultry.items,first.appearance = poultry.dates) %>%
+  kable(caption = "First Appearance of Poultry Items", format="html") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE, position = "left")
+```
+
+I'm inclined to ignore the family for now. It may be useful to split out the items with shorter histories, but for now they'll be ignored.
+
+For one more view, let's look at the best selling items to see which families they belong to. This is more for the sake of interest. We'll just use total unit sales over the full data.
+
+```{r}
+train.item[, .(unit.sales = sum(unit.sales)), by =.(item.nbr,family)][order(-unit.sales)] %>% head(10) %>%
+  kable(caption = "Top 10 Selling Items at Corporacion Favorita", format="html") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE, position = "left")
+```
+```{r include=FALSE}
+rm(list=c("train.item","item.summary","poultry.dates","poultry.items"))
+```
+
+No real surprises here. The top selling items are consumables. We're not sure what they are - my only guess is that the dairy item is probably milk.
+
+
+#Variable Creation and Transformation
+
+Now, we're almost ready to start some modeling. However - some of our data is not in the easiest format, particularly the holiday data.
+
+After a lot of data experimentation, I also decided to model *monthly* unit sales. A lot of the items don't sell daily. Zero-inflated models are an option, but given the size of the data set and the lack of information about each item, monthly seems reasonable.
+
+``` {r message=FALSE}
+holidays.local <- filter(holidays, locale == "Local" & transferred == FALSE & holiday.type != "Work Day") %>%
+                    select(date, locale.name, week, year) %>%
+                    mutate(local.marker = 1)
+
+holidays.regional<- filter(holidays, locale == "Regional" & transferred == FALSE & holiday.type != "Work Day") %>%
+                    select(date, locale.name, week, year) %>%
+                    mutate(regional.marker = 1)
+
+holidays.national<- filter(holidays, locale == "National" & transferred == FALSE & holiday.type != "Work Day" &
+                             !grepl(pattern="Mundial de futbol", x=description) &
+                             !grepl(pattern="Terremoto", x=description)) %>%
+                    select(date, locale.name, week, year) %>%
+                    mutate(national.marker = 1)
+
+earthquake <- holidays %>%
+                select(date, earthquake) %>%
+                filter(earthquake == 1) %>%
+                rename(earthquake.marker = earthquake)
+
+storeholidays <- data.frame(date=rep(seq(min(train$date, na.rm = TRUE), max(train$date, na.rm = TRUE), by = "days"), times = length(unique(stores$store.nbr))),
+                            store.nbr = rep(unique(stores$store.nbr), each=length(seq(min(train$date, na.rm = TRUE), max(train$date, na.rm = TRUE), by = "days"))))
+store.opendates <- train %>%
+                    group_by(store.nbr) %>%
+                    summarize(opendate = min(date, na.rm = TRUE))
+storeholidays <- left_join(storeholidays, store.opendates)
+storeholidays <- storeholidays %>% filter(date >= opendate) %>% select(-opendate)
+
+# The joins are done in separate steps for verification at each step
+storeholidays <- left_join(storeholidays, select(stores,-type))
+storeholidays <- left_join(storeholidays, select(holidays.local,-week,-year), by = c("date" = "date", "city" = "locale.name"))
+storeholidays <- left_join(storeholidays, select(holidays.regional,-week,-year), by = c("date" = "date", "state" = "locale.name"))
+storeholidays <- left_join(storeholidays, select(holidays.national,-week,-year,-locale.name), by = "date")
+storeholidays <- storeholidays %>% left_join(earthquake)
+storeholidays <- distinct(storeholidays) #Some duplicates created in join (from date/)
+
+storeholidays <- storeholidays %>%
+                  mutate_at(.vars = vars(ends_with("marker")), .funs = funs(replace_na), value=0)
+
+storeholidays <- storeholidays %>% left_join(calendar)
+
+storeholidays <- storeholidays %>% mutate(holiday = pmax(local.marker,regional.marker,national.marker))
+storeholidays.reduced <- storeholidays %>% group_by(store.nbr,year,month) %>% summarize(holidays = sum(holiday))
+
+
+oil.m <- oil %>%
+            group_by(year,month) %>%
+            summarize(oil.price = median(oil.price,na.rm=TRUE)) %>%
+            ungroup() %>%
+            mutate(oil.price.2lag = lag(oil.price,2))
+
+oil <- left_join(oil,calendar %>% select(date, week, year))
+
+train <- train[, onpromotion := onpromotion * 1]
+
+train <- train[date < as.Date("2017-08-01")] #August 2017 is a partial month of data
+
+#Joins of other variable types
+train <- left_join(train,oil)
+train <- left_join(train, storeholidays[, c("date","store.nbr","earthquake.marker","payday","payweek","holiday")])
+train <- left_join(train, items[, c("item.nbr","family","perishable")])
+train <- left_join(train, stores[, c("store.nbr","cluster")]) %>% data.table()
+train$storeitem <- paste0(train$store.nbr,"_",train$item.nbr)
+
+#There are no zeroes in the data, but there are negatives
+train <- train[unit.sales > 0,]
+
+
+##Creating monthly data
+train.m <- train %>%
+            left_join(calendar[,c("date","month")]) %>%
+            group_by(year,month,store.nbr,item.nbr,family,storeitem) %>%
+            summarise(unit.sales = sum(unit.sales),
+                      daysonpromotion = sum(onpromotion), #If there were no sales, promotion days are not identified
+                      earthquake.marker = max(earthquake.marker),
+                      holidays = sum(holiday)) %>%
+            ungroup() %>%
+            left_join(oil.m)
+
+train.mholidays <- train.m %>% group_by(year,month,store.nbr) %>% summarize(holidays = max(holidays))
+
+train.m <- train.m %>%
+            select(-holidays) %>%
+            left_join(train.mholidays) %>%
+            data.table()
+
+stores.cut <- store.opendates %>%
+                filter(opendate > as.Date("2014-01-01")) %>%
+                select(store.nbr) %>% unlist %>% unname()
+train.m <- train.m %>% filter(!store.nbr %in% stores.cut) %>% data.table()
+
+nochangeitems <- train.m %>% filter(item.nbr == 165594 & store.nbr==1) %>% select(year,month,earthquake.marker,oil.price,oil.price.2lag)
+
+```
+
+##Modeling Prelim
+
+In total, I tried 6 different types of models:
+
+- Generalized Additive Models (GAM) - both Poisson and Gamma, both with log links
+- Poisson Regression (Time Series Implementation)
+- A Naive Choice - Value from Previous Year (12 month lag)
+- ARIMA
+- Holt
+- ETS
+
+Though other variables were considered when using Generalized Additive Models and Poisson Regression, they didn't seem to add much.
+
+My very first step was to use Random Forest for variable selection. I thought this might give me some idea of which variables were valuable. In every specification I tried, the lags of the dependent variable were by far the most predictive. This isn't unexpected - but after removing them, nothing seems to make much of a difference.
+
+The data has no obvious trend. Annoyingly, there are huge spikes on many of the items, often an increase in the area of 300-400%, with no apparent explanation. We also have some periods with zero sales. Some of this could be due to seasonal products (think egg nog), but often the zero sales did not line up with a particular time. Many of these items were not included in the final predictions. There is likely a good explanation (stock outs, or possibly a substitute product). However - we do not have access to the explanation!
+
+The more "pure" time series models showed that most of the sales data looks like white noise. This is why in most cases, those three models return the same prediction for each month (the mean of the white noise).
+
+Stores opened since the start of 2014 have been removed from the data set only for the sake of making the comparisons consistent. The code below will still run on stores with "incomplete" data.
+
+Though the output is not shown, a quick random forest model was created to check variable performance. Few variables were available, and none performed particularly well. I added in the lag variables (._wprior) briefly when calculating weekly data, and they are much better predictors (as might be expected) than anything else I've found in the data.
+
+```{r randomForest, warning=FALSE, message=FALSE}
+# Initial Random Forest to check variable importance
+# 
+# cf.mod.rf <- randomForest(unit.sales ~
+#         week 
+#       + sales.1wprior
+#       + sales.2wprior
+#       + sales.3wprior
+#       + sales.4wprior
+#       + oil.4wprior
+#       + oil.12wprior
+#       + earthquake.marker
+#       + payweek
+#       + holiday
+#       + perishable
+#    , data=train.small
+#    , ntree = 200
+#    , importance = TRUE)
+# 
+# plot(cf.mod.rf)
+# varImpPlot(cf.mod.rf,
+#            sort = T,
+#            main="Variable Importance",
+#            n.var=5)
+#  
+# var.imp <- data.frame(importance(cf.mod.rf,
+#            type=2))
+# var.imp$Variables <- row.names(var.imp)
+# var.imp
+```
+
+The following modeling loop runs in about 4-5 hours (It's a good thing we're only using 10% of the items in the data set). Each model runs very quickly - the data set for a given store/item isn't that large, but since it is being built on each loop and there are a rough 400 items * 50 stores... a lot of small times add up to 1 big time!
+
+The packages used here include the *forecast* and *tscount* packages for time series, and the *mgcv* package for generalized additive models. The *sjmisc* and *stringr* packages also gets mentions for on-the-fly data cleanup in single functions.
+
+```{r eval=FALSE, message=FALSE}
+storeitems <- unique(train.m$storeitem) #A combination of store_item for easier looping/results (1 value is easier than 2)
+storeitems.small <- unique(train.m$storeitem[train.m$store.nbr == 1]) #1 store for initial testing
+
+#Function for pulling MAPE from a specific table (straight.ts) in the modeling loop
+  MAPEcalc <- function(typemethod) {
+      result <- straight.ts %>%
+      filter(type == typemethod) %>%
+      select(MAPE) %>%
+      as.numeric()
+      result
+  }
+  
+  
+mapefigs <- data.frame(store.item="",MAPE="",values=0.00) #Initializing a data frame to store mean absolute percentage error
+nn <- 1
+
+options(warn=-1) #Clean up output a little while looping - the warnings are all related to binding rows with character/factor variables
+for (i in storeitems) { #BEGIN LOOP
+  
+  print(c(i,paste0(round(nn/length(storeitems)*100,1),"%")))
+  nn <- nn + 1
+  
+  #Data Set with all available months of data for a store_item
+  train.small.alltime <- train.m[storeitem == i] %>%
+                          select(year,month,storeitem,store.nbr,unit.sales,daysonpromotion) %>%
+                          tbl_df()
+  
+  #Remove anything with fewer than 2.5 years of sales; This could be set much lower
+  if (dim(train.small.alltime)[1] < 30) {
+    next
+  }
+  
+  #Limiting data to start of item promotion data, and removing promotion column if the item was never on promotion (no point including a constant in our model)
+  train.small <- train.small.alltime %>% filter(year != 2013 & !(year == 2014 & month < 4) & !(year==2017 & month > 7))
+
+  zerosumcols <- data.frame(sumcol = colSums(train.small %>% select(-storeitem))) %>%
+                mutate(varnames = rownames(.)) %>%
+                filter(sumcol == 0) %>%
+                select(varnames) %>%
+                unlist() %>% unname() #This is all overly explicit/verbose, but colSums solution wasn't working                 
+  train.small <- train.small[, !names(train.small) %in% zerosumcols]
+  train.small <- train.small %>%
+                  mutate(date = as.Date(paste0(year,"-",str_pad(month,width=2,side="left",pad="0"),"-01")))
+
+  #Building a consistent data frame that allows for months with 0 sales, adding new variables, and removing all months before first sale
+  month.series <- data.frame(year=rep(2014:2017,each=12),month=1:12,storeitem = unique(train.small$storeitem),store.nbr = unique(train.small$store.nbr)) %>%
+                    filter(!(year == 2014 & month < 5), !(year == 2017 & month > 7)) %>%
+                    left_join(train.small) %>%
+                    mutate(unit.sales = sjmisc::replace_na(unit.sales,value=0),
+                           cumunits = cumsum(unit.sales)) %>%
+                    left_join(nochangeitems) %>%
+                    left_join(storeholidays.reduced) %>%
+                    filter(cumunits > 0) %>%
+                    select(-cumunits) %>%
+                    mutate(date = as.Date(paste0(year,"-",str_pad(month,width=2,side="left",pad="0"),"-01")))
+
+  #Because replace_na will fail/error if daysonpromotion has been removed from the data set
+  if ("daysonpromotion" %in% names(month.series)) {
+      month.series$daysonpromotion <- sjmisc::replace_na(month.series$daysonpromotion, value = 0)
+  } #END IF
+         
+  #Creating time series data for modeling           
+  train.ts <- ts(month.series[,!names(month.series) %in% c("year","month","date","store.nbr","item.nbr","storeitem")], start=c(month.series$year[1],month.series$month[1]), frequency=12)
+  y.ts       <- train.ts[,"unit.sales"]+1
+  regressors <- train.ts[,!colnames(train.ts) %in% c("unit.sales","oil.price")]
+  
+  y.train <- window(y.ts, end = c(2017,4))
+  y.test  <- window(y.ts, start = c(2017,5))
+  
+  regressors.train <- window(regressors, end = c(2017,4))
+  regressors.test  <- window(regressors, start = c(2017,5))
+  
+  #Poisson distribution with log link, implemented with time series count data from the tscount package:
+  salesfit <- tsglm(ts=y.train, link="log",
+  model=list(past_obs=c(1, 2, 3, 12)), xreg=regressors.train, distr="poisson")
+  
+  
+  fits <- data.frame(fitted = ceiling(salesfit$fitted.values), type = "fit")
+  predicted <- data.frame(fitted = ceiling(predict(salesfit, n.ahead = 3, level=1-.1/12, B=100, newxreg = regressors.test)$pred), type="predicted")
+  modelfigs <- bind_rows(fits,predicted)
+  
+  #Straight time series for comparison (note the y.ts+1 and lambda=0 for log transformation (ets excluded))
+  ARIMA.results <- data.frame(year = 2017,
+                              month=5:7,
+                              unit.sales = ceiling((auto.arima(window(y.ts+1, end = c(2017,4)),lambda=0) %>% forecast(h=3))$mean),
+                              type="arimapred",
+                              date=c("2017-05-01","2017-06-01","2017-07-01"))
+  
+  holt.results <- data.frame(year = 2017,
+                              month=5:7,
+                              unit.sales = ceiling((holt(window(y.ts+1, end = c(2017,4)),lambda=0) %>% forecast(h=3))$mean),
+                              type="holtpred",
+                              date=c("2017-05-01","2017-06-01","2017-07-01"))
+  
+  ets.results  <- data.frame(year = 2017,
+                             month=5:7,
+                             unit.sales = ceiling((ets(window(y.ts+1, end = c(2017,4))) %>% forecast(h=3))$mean),
+                             type="etspred",
+                             date=c("2017-05-01","2017-06-01","2017-07-01"))
+  
+  #GAM from mcgv package does not like creating variables within the model call - creating ahead of time
+  month.series <- month.series %>%
+                  mutate(unit.sales.lag1 = lag(unit.sales),
+                         unit.sales.lag2 = lag(unit.sales,2))
+  
+  
+  #Generalized Additive Models (Poisson/Gamma)
+  if ("daysonpromotion" %in% names(month.series)) {
+
+    cf.mod.pois <- gam(unit.sales + 1 ~
+       te(unit.sales.lag1,k = 6)
+      + te(unit.sales.lag2,k = 6)
+      + earthquake.marker
+      + daysonpromotion
+      + holidays
+      + oil.price.2lag
+
+    , family = poisson(link="log")
+    , data=month.series[month.series$date < as.Date("2017-05-01"),])
+
+  gam.pois.results  <- data.frame(year = 2017,
+                             month=5:7,
+                             unit.sales = ceiling(exp(predict(cf.mod.pois,month.series[month.series$date >= as.Date("2017-05-01"),]))),
+                             type="gamppred",
+                             date=c("2017-05-01","2017-06-01","2017-07-01"))
+  
+  cf.mod.gamma <- gam(unit.sales + 1 ~
+       te(unit.sales.lag1,k = 6)
+      + te(unit.sales.lag2,k = 6)
+      + earthquake.marker
+      + daysonpromotion
+      + holidays
+      + oil.price.2lag
+
+    , family = Gamma(link="log")
+    , data=month.series[month.series$date < as.Date("2017-05-01"),])
+
+  gam.gamma.results  <- data.frame(year = 2017,
+                           month=5:7,
+                           unit.sales = ceiling(exp(predict(cf.mod.gamma,month.series[month.series$date >= as.Date("2017-05-01"),]))),
+                           type="gamgpred",
+                           date=c("2017-05-01","2017-06-01","2017-07-01"))
+  
+  } else {
+      cf.mod.pois <- gam(unit.sales + 1 ~
+       te(unit.sales.lag1,k = 6)
+      + te(unit.sales.lag2,k = 6)
+      + earthquake.marker
+      + holidays
+      + oil.price.2lag
+
+    , family = poisson(link="log")
+    , data=month.series[month.series$date < as.Date("2017-05-01"),])
+
+  gam.pois.results  <- data.frame(year = 2017,
+                             month=5:7,
+                             unit.sales = ceiling(exp(predict(cf.mod.pois,month.series[month.series$date >= as.Date("2017-05-01"),]))),
+                             type="gamppred",
+                             date=c("2017-05-01","2017-06-01","2017-07-01"))
+  
+  cf.mod.gamma <- gam(unit.sales + 1 ~
+       te(unit.sales.lag1,k = 6)
+      + te(unit.sales.lag2,k = 6)
+      + earthquake.marker
+      + holidays
+      + oil.price.2lag
+
+    , family = Gamma(link="log")
+    , data=month.series[month.series$date < as.Date("2017-05-01"),])
+
+  gam.gamma.results  <- data.frame(year = 2017,
+                           month=5:7,
+                           unit.sales = ceiling(exp(predict(cf.mod.gamma,month.series[month.series$date >= as.Date("2017-05-01"),]))),
+                           type="gamgpred",
+                           date=c("2017-05-01","2017-06-01","2017-07-01"))
+  } #END IF
+  
+  #Data frame of time series results
+  straight.ts <- bind_rows(ARIMA.results,holt.results,ets.results,gam.pois.results,gam.gamma.results) %>%
+                    left_join(train.small %>% select(year,month, actual=unit.sales)) %>%
+                    mutate(pct.err = abs((unit.sales-1-actual))/actual) %>%
+                    group_by(type) %>%
+                    summarize(MAPE = mean(pct.err, na.rm =))
+  
+  #Getting forecasts into data frames for comparison
+  naivepred <- train.small.alltime %>%
+                mutate(year = year + 1,
+                       date = as.Date(paste0(year,"-",str_pad(month, width=2, side="left", pad="0"),"-01")),
+                       type = "prevyear") %>%
+                filter(!(year == 2014 & month < 5), !(year == 2017 & month > 7), !(year == 2018)) %>%
+                select(year,month,unit.sales,type,date)
+  
+  #This is ugly, but it works (could be reformatted for consistency) - not a presentation data frame
+  month.results <- bind_cols(month.series,modelfigs) %>%
+                      select(year, month, unit.sales, fitted, type) %>%
+                      mutate(fitted = fitted-1) %>%
+                      left_join(naivepred %>% select(-date) %>% rename(unit.sales.naive = unit.sales, naivetype=type), by=c("year","month"))
+  
+  #MAPE calculations for each model type
+  MAPE.predicted <- month.results %>% filter(type == "predicted") %>% mutate(pct.err = abs((fitted-unit.sales)/unit.sales)) %>% select(pct.err) %>% unlist() %>% unname() %>% mean()
+  MAPE.naive   <- month.results %>% filter(year == 2017 & month %in% 5:7) %>% mutate(pct.err = abs((unit.sales.naive-unit.sales)/unit.sales)) %>% select(pct.err) %>% unlist() %>% unname() %>% mean()
+  MAPE.arima <- MAPEcalc("arimapred")
+  MAPE.holt  <- MAPEcalc("holtpred")
+  MAPE.ets   <- MAPEcalc("etspred")
+  MAPE.gampois <- MAPEcalc("gamppred")
+  MAPE.gamgam  <- MAPEcalc("gamgpred")
+  
+  #Adding results for this store_item to results data frame on each loop
+  #It's better to create an object ahead of time and fill it in vs this method; but, this is small and there's little speed improvement
+  mapefigs <- bind_rows(mapefigs, data.frame(store.item = unique(train.small$storeitem), MAPE = c("model","prevyear","arima","holt","ets","gampois","gamgam"),
+                                             values = round(c(MAPE.predicted,MAPE.naive,MAPE.arima,MAPE.holt,MAPE.ets,MAPE.gampois,MAPE.gamgam),3)))
+
+
+} #END FOR LOOP
+options(warn=0)
+```
+
+
+```{r plotprep, echo=FALSE, warning=FALSE, message=FALSE}
+#This is solely to prepare for a single plot.
+
+options(warn=-1) #Clean up output a little while looping - the warnings are all related to binding rows with character/factor variables
+for (i in "38_362548") { #BEGIN LOOP
+  
+  #Data Set with all available months of data for a store_item
+  train.small.alltime <- train.m[storeitem == i] %>%
+                          select(year,month,storeitem,store.nbr,unit.sales,daysonpromotion) %>%
+                          tbl_df()
+  
+
+  #Limiting data to start of item promotion data, and removing promotion column if the item was never on promotion (no point including a constant in our model)
+  train.small <- train.small.alltime %>% filter(year != 2013 & !(year == 2014 & month < 4) & !(year==2017 & month > 7))
+
+  zerosumcols <- data.frame(sumcol = colSums(train.small %>% select(-storeitem))) %>%
+                mutate(varnames = rownames(.)) %>%
+                filter(sumcol == 0) %>%
+                select(varnames) %>%
+                unlist() %>% unname() #This is all overly explicit/verbose, but colSums solution wasn't working                 
+  train.small <- train.small[, !names(train.small) %in% zerosumcols]
+  train.small <- train.small %>%
+                  mutate(date = as.Date(paste0(year,"-",str_pad(month,width=2,side="left",pad="0"),"-01")))
+
+  #Building a consistent dat frame that allows for months with 0 sales, adding new variables, and removing all months before first sale
+  month.series <- data.frame(year=rep(2014:2017,each=12),month=1:12,storeitem = unique(train.small$storeitem),store.nbr = unique(train.small$store.nbr)) %>%
+                    filter(!(year == 2014 & month < 5), !(year == 2017 & month > 7)) %>%
+                    left_join(train.small) %>%
+                    mutate(unit.sales = sjmisc::replace_na(unit.sales,value=0),
+                           cumunits = cumsum(unit.sales)) %>%
+                    left_join(nochangeitems) %>%
+                    left_join(storeholidays.reduced) %>%
+                    filter(cumunits > 0) %>%
+                    select(-cumunits) %>%
+                    mutate(date = as.Date(paste0(year,"-",str_pad(month,width=2,side="left",pad="0"),"-01")))
+
+  #Because replace_na will fail/error if daysonpromotion has been removed from the data set
+  if ("daysonpromotion" %in% names(month.series)) {
+      month.series$daysonpromotion <- sjmisc::replace_na(month.series$daysonpromotion, value = 0)
+  } #END IF
+         
+  #Creating time series data for modeling           
+  train.ts <- ts(month.series[,!names(month.series) %in% c("year","month","date","store.nbr","item.nbr","storeitem")], start=c(month.series$year[1],month.series$month[1]), frequency=12)
+  y.ts       <- train.ts[,"unit.sales"]+1
+  regressors <- train.ts[,!colnames(train.ts) %in% c("unit.sales","oil.price")]
+  
+  y.train <- window(y.ts, end = c(2017,4))
+  y.test  <- window(y.ts, start = c(2017,5))
+  
+  regressors.train <- window(regressors, end = c(2017,4))
+  regressors.test  <- window(regressors, start = c(2017,5))
+  
+  #Poisson distribution with log link, implemented with time series count data from the tscount package:
+  salesfit <- tsglm(ts=y.train, link="log",
+  model=list(past_obs=c(1, 2, 3, 12)), xreg=regressors.train, distr="poisson")
+  
+  
+  fits <- data.frame(fitted = ceiling(salesfit$fitted.values), type = "fit")
+  predicted <- data.frame(fitted = ceiling(predict(salesfit, n.ahead = 3, level=1-.1/12, B=100, newxreg = regressors.test)$pred), type="predicted")
+  modelfigs <- bind_rows(fits,predicted)
+ 
+  
+  #Getting forecasts into data frames for comparison
+  naivepred <- train.small.alltime %>%
+                mutate(year = year + 1,
+                       date = as.Date(paste0(year,"-",str_pad(month, width=2, side="left", pad="0"),"-01")),
+                       type = "prevyear") %>%
+                filter(!(year == 2014 & month < 5), !(year == 2017 & month > 7), !(year == 2018)) %>%
+                select(year,month,unit.sales,type,date)
+  
+  #This is ugly, but it works (could be reformatted for consistency) - not a presentation data frame
+  month.results <- bind_cols(month.series,modelfigs) %>%
+                      select(year, month, unit.sales, fitted, type) %>%
+                      mutate(fitted = fitted-1) %>%
+                      left_join(naivepred %>% select(-date) %>% rename(unit.sales.naive = unit.sales, naivetype=type), by=c("year","month"))
+  
+} #END FOR LOOP
+options(warn=0)
+```
+
+
+And, to make up for all that text, a couple of sample graphics showing model results:
+
+```{r modelplots, warning=FALSE, message=FALSE}
+#Plotting - these are intended to be run on a single store_item - not included in loop
+#Also does not include time series (it's doable, but the plot gets messy)
+
+#Plot of standardized residuals vs fitted values - these generally looked good
+plotstdres <- data.frame(fitted=salesfit$fitted.values, stdres=scale(salesfit$residuals))
+ggplot(plotstdres,aes(x=fitted, y=stdres)) +
+ geom_point() +
+ geom_smooth(method="lm", se = FALSE) +
+ ggtitle("Standardized Residuals vs Fitted Values") +
+ theme_bw()
+```
+
+Not bad as far as residuals plots go! This is one model of thousands, to be fair.
+
+```{r modelplots2, warning=FALSE, message=FALSE}
+#Data Preparation
+month.plotting <- bind_rows(month.results[,c("year","month","unit.sales")] %>% mutate(type = "actual"),
+    month.results[,c("year","month","fitted","type")] %>% rename(unit.sales = fitted))
+
+month.plotting$date <- as.Date(paste0(month.plotting$year,"-",str_pad(month.plotting$month, width=2, side="left", pad="0"),"-01"))
+
+month.plotting <- bind_rows(month.plotting,naivepred)
+
+#Actuals/Fitted Values/Predicted Values/Previous Year for comparison
+ggplot(month.plotting, aes(x=date, y=unit.sales, colour=type)) +
+  geom_line(size=1) +
+  ggtitle("Visual Overview of Fit and Prediction (3 months)") +
+  scale_color_manual(values = c("grey","black","blue","orange")) +
+  theme_bw()
+
+```
+
+I cherry picked this item with a perfect prediction. Notice all the overlap. Sales on this item are very consistent, with a notable upward trend and clear seasonabl peaks.Just choosing the previous year's sales as the prediction would have missed, but been reasonable.
+
+As I'm building models, I think, "what would the analyst with some sales history and Excel do?". If my model isn't beating that, it's unlikely anyone will take it seriously (the additional explanations of how the models work can be a turn off, but everyone understands "we just figured it'd be about the same as last year, but added 5% because something something social media").
+
+
+```{r include=FALSE}
+mapefigs <- read.fst("mapefigs_wgam.fst")
+mapefigs <- mapefigs[-1,]
+mapefigs <- spread(mapefigs,MAPE,values)
+
+mapestillsold <- mapefigs
+mapestillsold <- mapestillsold %>% filter(!is.infinite(model))
+#Generally this can be done with mutate_at, but... I named variables after functions (bad);
+#There are other options to avoid writing it out, but this is a good punishment
+mapestillsold <- mapestillsold %>%
+                  mutate(arima    = ifelse(arima    > 2, 2, arima),
+                         gamgam   = ifelse(gamgam   > 2, 2, gamgam),
+                         gampois  = ifelse(gampois  > 2, 2, gampois),
+                         holt     = ifelse(holt     > 2, 2, holt),
+                         ets      = ifelse(ets      > 2, 2, ets),
+                         model    = ifelse(model    > 2, 2, model),
+                         prevyear = ifelse(prevyear > 2, 2, prevyear))
+
+mapenumeric   <- mapestillsold %>%
+                    mutate_all(.funs = funs(sjmisc::replace_na), value=1000)
+mapenumeric$bestpred <- do.call(pmin,mapenumeric[,2:8])
+mapenumeric$winner <- names(mapenumeric[,2:8])[max.col(mapenumeric[,2:8]*-1,ties.method="last")]
+mapenumeric$prevyear[mapenumeric$prevyear == 1000] <- NA
+mapenumeric$ets[mapenumeric$ets== 1000] <- NA
+mapenumeric$gamgam[mapenumeric$gamgam == 1000] <- NA
+mapenumeric$gampois[mapenumeric$gampois == 1000] <- NA
+mapenumeric$holt[mapenumeric$holt == 1000] <- NA
+mapenumeric$model[mapenumeric$model == 1000] <- NA
+mapenumeric$arima[mapenumeric$arima == 1000] <- NA
+mapenumeric$bestpred[mapenumeric$bestpred == 1000] <- NA
+```
+
+
+##Model Specification
+
+The GAM was the trickiest for specification. Since it was necessary to consider a model that would be acceptable for use on all items. Using Random Forest and a lot of trial and error with different items, I landed on the following:
+  sales = spline(1 month sales lag, 6 knots) + spline(2 month sales lag, 6 knots) + earthquake.indicator + daysonpromotion (removed if none) + holidays + 2 month lag oil price
+  
+The GAM model used the Poisson family with a log link (as did the Poisson Regression, naturally enough)
+
+The nice thing about the time series models from R's forecast package is that they're automatically specified. The auto.arima function tests many different options and returns the "best" order (based on minimizing AICc). In most cases, the order returned was (0,0,0) for white noise. In some cases, I saw (0,0,1), meaning a 1 month error lag was used for prediction. The only specification I needed was a lambda term for transformation. Though there is a built in BoxCox.lambda function, it didn't work well with the count data. It usually chose the inverse (lambda = -1), and that did not perform well in the sense that there were too many errors. In the end, I used lambda=0 for a log transformation, and added 1 to the dependent variable to avoid the inevitable errors for log(0). The result is a log(1+x) transformation, which also helps avoid negative number predictions for a positive/discrete outcome variable.
+
+##Performance
+
+Well, there wasn't any. The following tables show a) a breakdown of which model performed best, b) the mean MAPE for each method c) a summary of MAPEs for the best performing method on each store/item.
+
+It would be nice to have some consistency, particularly given the strong showing from the "Well, just use whatever we did last year" method.
+
+```{r}
+table(mapenumeric$winner) %>%
+  data.frame() %>%
+  rename(method = Var1, bestmodel.count = Freq) %>%
+  kable(format="html") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE, position = "left")
+meanmape <- lapply(mapenumeric[,2:9],mean,na.rm=TRUE) %>%
+  unlist() %>%
+  data.frame()
+meanmape$method <- rownames(meanmape)
+names(meanmape) <- c("mean","method")
+meanmape <- tbl_df(meanmape) %>% select(method,mean)
+rownames(meanmape) <- NULL
+kable(meanmape, format="html") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE, position = "left")
+summary(mapenumeric$bestpred)
+```
+
+What is clear, however, is that the more than half of the best predictions had MAPEs better than 16%. This might suggest that rather than having a single well-specified model, this problem could benefit from choosing the right model for the right problem. For example, much of the data is integer/count data, but there are some items sold by weight. Methods utilizing the Poisson distribution likely aren't performing as well on this non-integer data. Some items are also seasonal and others are not, which means the Holt time series (simple exponential smoothing + trend) may not pick up on this in a way that the ets model might (ETS: Error, Trend, Seasonality).
+
+While all of the models had mean MAPEs in the 40-50% range (not very good), the summary of the best predicted method gives me hope that a combination of these models can predict successfully.
+
+
+
+#Conclusion
+
+There is a lot that can be done to extend these models. In the online competition version of this data, predicting daily sales has been a challenge for many submitters. For many items, a well performing result on many of the items is just to predict that it will never sell again. Of course, that doesn't do a grocery store a lot of good. They may only sell one unit of the item per week, but some items have long shelf lives. Low model error doesn't mean much if the result is bankruptcy.
+
+The big solution here is to not have one big solution. It won't be quite as simple as choosing the best performing model on each. This is only tested on 3 months of data, after all. A next step might be to find patterns in model performance. If Holt was the best performer the most times, what do Holt's second place finishers look like? Was it usually ets? If so, that tells us something valuable. If not, it's a matter of "clustering" items into model performance families.
+
+
+##Ideas
+
+* There's still some chance of getting a better specification on the GAMs - some clustering before modeling and specifying a different model may help
+* I may also try to identify the characteristics of the store clusters; there's not much to go on beyond total sales / some guesses at populations in their local areas, but it may give a slightly better result in modeling if we can get some kind of multiplier on the store cluster.
+* Given how holidays is calculated (# of holidays in month), I expected a better result from this variable. Sales are highest in December in many cases, and December has the most holiday days. There is likely a specific subset of items that sell differently on holidays. These could be identified and modeled separately.
+* I'll never see the data, but I will complain one last time about not having pricing
+
+##Next Steps
+
+* Separate the items into model clusters (which items perform best with which model); In some cases two models are very close in terms of performance
+* Many items did not have enough history to be predicted with the current model structure; some items are new, some are no longer sold, and some have long periods with no sales, then pick up again - separate into these 3 groups and perform the modeling exercise on anything with at least 12 months of history (vs the 30 month cutoff used)
+* View item families by model performance; did produce always perform well using ets? Answer these kinds of questions.
+
