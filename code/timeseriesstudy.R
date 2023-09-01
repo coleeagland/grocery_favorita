@@ -1,4 +1,4 @@
-DT <- as.data.table(read_feather("C:/Users/LA40405/Desktop/gamtime/DT_4_ind"))
+DT <- as.data.table(read_feather("C:/Users/cole/gamtime/DT_4_ind"))
 DT[, week_num := as.integer(car::recode(week,
                                         "'Monday'='1';'Tuesday'='2';'Wednesday'='3';'Thursday'='4';
                                         'Friday'='5';'Saturday'='6';'Sunday'='7'"))]
